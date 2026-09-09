@@ -5,12 +5,13 @@ use std::{
     num::NonZeroUsize,
     pin::Pin,
     sync::{Arc, RwLock, RwLockReadGuard, TryLockError, atomic::AtomicBool},
-    task::{Context, Poll},
+    task::{Context, Poll, Wake, Waker},
 };
 
 use atomic_waker::AtomicWaker;
 use noq_udp::Transmit;
 use tokio::io::Interest;
+use tokio::sync::{Notify, futures::OwnedNotified};
 use tracing::{debug, trace, warn};
 
 use super::IpFamily;
@@ -20,9 +21,63 @@ use super::IpFamily;
 pub struct UdpSocket {
     socket: RwLock<SocketState>,
     recv_waker: AtomicWaker,
-    send_waker: AtomicWaker,
+    send_wake: Arc<SendWake>,
+    send_ready: Waker,
     /// Set to true, when an error occurred, that means we need to rebind the socket.
     is_broken: AtomicBool,
+}
+
+/// Tokio's poll-based UDP readiness retains only one waker. Always give it this
+/// shared waker, then notify each independently registered async sender. Keeping
+/// readiness futures on the inner socket instead would keep that socket alive
+/// across rebind and prevent the old port from being released.
+#[derive(Debug, Default)]
+struct SendWake {
+    poll: AtomicWaker,
+    waiters: Arc<Notify>,
+}
+
+impl Wake for SendWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.poll.wake();
+        self.waiters.notify_waiters();
+    }
+}
+
+/// One registration per pending send, removed on completion or cancellation.
+#[derive(Debug, Default)]
+struct SendWaiter {
+    notified: Option<Pin<Box<OwnedNotified>>>,
+}
+
+impl SendWaiter {
+    fn poll(&mut self, socket: &UdpSocket, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            // Avoid allocating a waiter when the socket is already writable.
+            if let Poll::Ready(result) = socket.poll_writable_inner() {
+                self.notified = None;
+                return Poll::Ready(result);
+            }
+            let notified = self
+                .notified
+                .get_or_insert_with(|| Box::pin(socket.send_wake.waiters.clone().notified_owned()));
+            notified.as_mut().enable();
+            // Register before rechecking: a rebind/readiness notification may
+            // have happened between the first check and registration.
+            if let Poll::Ready(result) = socket.poll_writable_inner() {
+                self.notified = None;
+                return Poll::Ready(result);
+            }
+            match notified.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(()) => self.notified = None,
+            }
+        }
+    }
 }
 
 /// UDP socket read/write buffer size (7MB). The value of 7MB is chosen as it
@@ -79,30 +134,33 @@ impl UdpSocket {
 
     /// Rebind the underlying socket.
     pub fn rebind(&self) -> io::Result<()> {
-        {
+        let result = {
             let mut guard = self.socket.write().unwrap();
-            guard.rebind()?;
+            let result = guard.rebind();
 
             // Clear errors
-            self.is_broken
-                .store(false, std::sync::atomic::Ordering::Release);
-
-            drop(guard);
-        }
+            if result.is_ok() {
+                self.is_broken
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+            result
+        };
 
         // wakeup
         self.wake_all();
 
-        Ok(())
+        result
     }
 
     fn bind_raw(addr: impl Into<SocketAddr>) -> io::Result<Self> {
         let socket = SocketState::bind(addr.into())?;
+        let send_wake = Arc::new(SendWake::default());
 
         Ok(UdpSocket {
             socket: RwLock::new(socket),
             recv_waker: AtomicWaker::default(),
-            send_waker: AtomicWaker::default(),
+            send_ready: Waker::from(send_wake.clone()),
+            send_wake,
             is_broken: AtomicBool::new(false),
         })
     }
@@ -154,6 +212,7 @@ impl UdpSocket {
         SendFut {
             socket: self,
             buffer,
+            waiter: SendWaiter::default(),
         }
     }
 
@@ -164,6 +223,7 @@ impl UdpSocket {
             socket: self,
             buffer,
             to,
+            waiter: SendWaiter::default(),
         }
     }
 
@@ -275,7 +335,7 @@ impl UdpSocket {
 
     fn wake_all(&self) {
         self.recv_waker.wake();
-        self.send_waker.wake();
+        self.send_ready.wake_by_ref();
     }
 
     /// Checks if the socket needs a rebind, and if so does it.
@@ -294,29 +354,40 @@ impl UdpSocket {
             return Ok(());
         }
 
-        guard.rebind()?;
-        self.is_broken
-            .store(false, std::sync::atomic::Ordering::Release);
+        let result = guard.rebind();
+        if result.is_ok() {
+            self.is_broken
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
         drop(guard);
         self.wake_all();
-        Ok(())
+        result
     }
 
-    /// Poll for writable
+    /// Poll for writable.
+    ///
+    /// Only the most recent caller of this method or [`Self::poll_send_noq`]
+    /// receives a wakeup. Use [`UdpSender`] for independent concurrent senders.
     pub fn poll_writable(&self, cx: &mut std::task::Context<'_>) -> Poll<io::Result<()>> {
+        self.send_wake.poll.register(cx.waker());
+        self.poll_writable_inner()
+    }
+
+    fn poll_writable_inner(&self) -> Poll<io::Result<()>> {
         loop {
             if let Err(err) = self.maybe_rebind() {
                 return Poll::Ready(Err(err));
             }
 
-            let guard = std::task::ready!(self.poll_read_socket(&self.send_waker, cx));
+            let guard = match self.socket.try_read() {
+                Ok(guard) => guard,
+                Err(TryLockError::Poisoned(e)) => panic!("socket lock poisoned: {e}"),
+                Err(TryLockError::WouldBlock) => return Poll::Pending,
+            };
             let (socket, _state) = guard.try_get_connected()?;
 
-            match socket.poll_send_ready(cx) {
-                Poll::Pending => {
-                    self.send_waker.register(cx.waker());
-                    return Poll::Pending;
-                }
+            match socket.poll_send_ready(&mut Context::from_waker(&self.send_ready)) {
+                Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(())) => return Poll::Ready(Ok(())),
                 Poll::Ready(Err(err)) => {
                     if let Some(err) = self.handle_write_error(err) {
@@ -358,42 +429,16 @@ impl UdpSocket {
         }
     }
 
-    /// poll send a noq based `Transmit`.
+    /// Poll send a noq based `Transmit`.
+    ///
+    /// Shares the most recent caller's waker with [`Self::poll_writable`]. Use
+    /// [`UdpSender`] for independent concurrent senders.
     pub fn poll_send_noq(&self, cx: &mut Context, transmit: &Transmit<'_>) -> Poll<io::Result<()>> {
         loop {
-            if let Err(err) = self.maybe_rebind() {
-                return Poll::Ready(Err(err));
-            }
-
-            let guard = n0_future::ready!(self.poll_read_socket(&self.send_waker, cx));
-            let (socket, state) = guard.try_get_connected()?;
-
-            match socket.poll_send_ready(cx) {
-                Poll::Pending => {
-                    self.send_waker.register(cx.waker());
-                    return Poll::Pending;
-                }
-                Poll::Ready(Ok(())) => {
-                    let res =
-                        socket.try_io(Interest::WRITABLE, || state.send(socket.into(), transmit));
-                    if let Err(err) = res {
-                        if err.kind() == io::ErrorKind::WouldBlock {
-                            continue;
-                        }
-
-                        if let Some(err) = self.handle_write_error(err) {
-                            return Poll::Ready(Err(err));
-                        }
-                        continue;
-                    }
-                    return Poll::Ready(res);
-                }
-                Poll::Ready(Err(err)) => {
-                    if let Some(err) = self.handle_write_error(err) {
-                        return Poll::Ready(Err(err));
-                    }
-                    continue;
-                }
+            n0_future::ready!(self.poll_writable(cx))?;
+            match self.try_send_noq(transmit) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                result => return Poll::Ready(result),
             }
         }
     }
@@ -634,45 +679,31 @@ impl Future for RecvFromFut<'_, '_> {
 pub struct SendFut<'a, 'b> {
     socket: &'b UdpSocket,
     buffer: &'a [u8],
+    waiter: SendWaiter,
 }
 
 impl Future for SendFut<'_, '_> {
     type Output = io::Result<usize>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
         loop {
-            if let Err(err) = self.socket.maybe_rebind() {
-                return Poll::Ready(Err(err));
-            }
-
-            let guard =
-                n0_future::ready!(self.socket.poll_read_socket(&self.socket.send_waker, cx));
+            n0_future::ready!(this.waiter.poll(this.socket, cx))?;
+            let guard = match this.socket.socket.try_read() {
+                Ok(guard) => guard,
+                Err(TryLockError::Poisoned(e)) => panic!("socket lock poisoned: {e}"),
+                Err(TryLockError::WouldBlock) => continue,
+            };
             let (socket, _state) = guard.try_get_connected()?;
 
-            match socket.poll_send_ready(cx) {
-                Poll::Pending => {
-                    self.socket.send_waker.register(cx.waker());
-                    return Poll::Pending;
-                }
-                Poll::Ready(Ok(())) => {
-                    let res = socket.try_send(self.buffer);
-                    if let Err(err) = res {
-                        if err.kind() == io::ErrorKind::WouldBlock {
-                            continue;
-                        }
-                        if let Some(err) = self.socket.handle_write_error(err) {
-                            return Poll::Ready(Err(err));
-                        }
-                        continue;
+            match socket.try_send(this.buffer) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) => {
+                    if let Some(error) = this.socket.handle_write_error(error) {
+                        return Poll::Ready(Err(error));
                     }
-                    return Poll::Ready(res);
                 }
-                Poll::Ready(Err(err)) => {
-                    if let Some(err) = self.socket.handle_write_error(err) {
-                        return Poll::Ready(Err(err));
-                    }
-                    continue;
-                }
+                Ok(count) => return Poll::Ready(Ok(count)),
             }
         }
     }
@@ -684,46 +715,31 @@ pub struct SendToFut<'a, 'b> {
     socket: &'b UdpSocket,
     buffer: &'a [u8],
     to: SocketAddr,
+    waiter: SendWaiter,
 }
 
 impl Future for SendToFut<'_, '_> {
     type Output = io::Result<usize>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
         loop {
-            if let Err(err) = self.socket.maybe_rebind() {
-                return Poll::Ready(Err(err));
-            }
-
-            let guard =
-                n0_future::ready!(self.socket.poll_read_socket(&self.socket.send_waker, cx));
+            n0_future::ready!(this.waiter.poll(this.socket, cx))?;
+            let guard = match this.socket.socket.try_read() {
+                Ok(guard) => guard,
+                Err(TryLockError::Poisoned(e)) => panic!("socket lock poisoned: {e}"),
+                Err(TryLockError::WouldBlock) => continue,
+            };
             let (socket, _state) = guard.try_get_connected()?;
 
-            match socket.poll_send_ready(cx) {
-                Poll::Pending => {
-                    self.socket.send_waker.register(cx.waker());
-                    return Poll::Pending;
-                }
-                Poll::Ready(Ok(())) => {
-                    let res = socket.try_send_to(self.buffer, self.to);
-                    if let Err(err) = res {
-                        if err.kind() == io::ErrorKind::WouldBlock {
-                            continue;
-                        }
-
-                        if let Some(err) = self.socket.handle_write_error(err) {
-                            return Poll::Ready(Err(err));
-                        }
-                        continue;
+            match socket.try_send_to(this.buffer, this.to) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) => {
+                    if let Some(error) = this.socket.handle_write_error(error) {
+                        return Poll::Ready(Err(error));
                     }
-                    return Poll::Ready(res);
                 }
-                Poll::Ready(Err(err)) => {
-                    if let Some(err) = self.socket.handle_write_error(err) {
-                        return Poll::Ready(Err(err));
-                    }
-                    continue;
-                }
+                Ok(count) => return Poll::Ready(Ok(count)),
             }
         }
     }
@@ -915,12 +931,9 @@ impl Drop for UdpSocket {
     }
 }
 
-pin_project_lite::pin_project! {
-    pub struct UdpSender {
-        socket: Arc<UdpSocket>,
-        #[pin]
-        fut: Option<Pin<Box<dyn Future<Output = io::Result<()>> + Send + Sync + 'static>>>,
-    }
+pub struct UdpSender {
+    socket: Arc<UdpSocket>,
+    waiter: SendWaiter,
 }
 
 impl Clone for UdpSender {
@@ -937,13 +950,16 @@ impl std::fmt::Debug for UdpSender {
 
 impl UdpSender {
     fn new(socket: Arc<UdpSocket>) -> Self {
-        Self { socket, fut: None }
+        Self {
+            socket,
+            waiter: SendWaiter::default(),
+        }
     }
 
     /// Async sending
     pub fn send<'a, 'b>(&self, transmit: &'a noq_udp::Transmit<'b>) -> SendFutNoq<'a, 'b> {
         SendFutNoq {
-            socket: self.socket.clone(),
+            sender: self.clone(),
             transmit,
         }
     }
@@ -954,45 +970,12 @@ impl UdpSender {
         transmit: &noq_udp::Transmit,
         cx: &mut Context,
     ) -> Poll<io::Result<()>> {
-        let mut this = self.project();
+        let this = self.get_mut();
         loop {
-            if let Err(err) = this.socket.maybe_rebind() {
-                return Poll::Ready(Err(err));
-            }
-
-            let guard =
-                n0_future::ready!(this.socket.poll_read_socket(&this.socket.send_waker, cx));
-
-            if this.fut.is_none() {
-                let socket = this.socket.clone();
-                this.fut.set(Some(Box::pin(async move {
-                    n0_future::future::poll_fn(|cx| socket.poll_writable(cx)).await
-                })));
-            }
-            // We're forced to `unwrap` here because `Fut` may be `!Unpin`, which means we can't safely
-            // obtain an `&mut Fut` after storing it in `this.fut` when `this` is already behind `Pin`,
-            // and if we didn't store it then we wouldn't be able to keep it alive between
-            // `poll_writable` calls.
-            let result = n0_future::ready!(this.fut.as_mut().as_pin_mut().unwrap().poll(cx));
-
-            // Polling an arbitrary `Future` after it becomes ready is a logic error, so arrange for
-            // a new `Future` to be created on the next call.
-            this.fut.set(None);
-
-            // If .writable() fails, propagate the error
-            result?;
-
-            let (socket, state) = guard.try_get_connected()?;
-            let result = socket.try_io(Interest::WRITABLE, || state.send(socket.into(), transmit));
-
-            match result {
-                // We thought the socket was writable, but it wasn't, then retry so that either another
-                // `writable().await` call determines that the socket is indeed not writable and
-                // registers us for a wakeup, or the send succeeds if this really was just a
-                // transient failure.
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                // In all other cases, either propagate the error or we're Ok
-                _ => return Poll::Ready(result),
+            n0_future::ready!(this.waiter.poll(&this.socket, cx))?;
+            match this.socket.try_send_noq(transmit) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                result => return Poll::Ready(result),
             }
         }
     }
@@ -1017,7 +1000,7 @@ impl UdpSender {
 /// Send future noq
 #[derive(Debug)]
 pub struct SendFutNoq<'a, 'b> {
-    socket: Arc<UdpSocket>,
+    sender: UdpSender,
     transmit: &'a noq_udp::Transmit<'b>,
 }
 
@@ -1025,46 +1008,13 @@ impl Future for SendFutNoq<'_, '_> {
     type Output = io::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        loop {
-            if let Err(err) = self.socket.maybe_rebind() {
-                return Poll::Ready(Err(err));
-            }
-
-            let guard =
-                n0_future::ready!(self.socket.poll_read_socket(&self.socket.send_waker, cx));
-            let (socket, state) = guard.try_get_connected()?;
-
-            match socket.poll_send_ready(cx) {
-                Poll::Pending => {
-                    self.socket.send_waker.register(cx.waker());
-                    return Poll::Pending;
-                }
-                Poll::Ready(Ok(())) => {
-                    let res = socket.try_io(Interest::WRITABLE, || {
-                        state.send(socket.into(), self.transmit)
-                    });
-
-                    if let Err(err) = res {
-                        if err.kind() == io::ErrorKind::WouldBlock {
-                            continue;
-                        }
-                        if let Some(err) = self.socket.handle_write_error(err) {
-                            return Poll::Ready(Err(err));
-                        }
-                        continue;
-                    }
-                    return Poll::Ready(res);
-                }
-                Poll::Ready(Err(err)) => {
-                    if let Some(err) = self.socket.handle_write_error(err) {
-                        return Poll::Ready(Err(err));
-                    }
-                    continue;
-                }
-            }
-        }
+        let this = self.get_mut();
+        Pin::new(&mut this.sender).poll_send(this.transmit, cx)
     }
 }
+
+#[cfg(test)]
+mod multi_sender_tests;
 
 #[cfg(test)]
 mod tests {
