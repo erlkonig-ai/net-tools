@@ -976,7 +976,7 @@ impl UdpSender {
         let this = self.get_mut();
         loop {
             n0_future::ready!(this.waiter.poll(&this.socket, cx))?;
-            match this.socket.try_send_noq(transmit) {
+            match this.try_send(transmit) {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
                 result => return Poll::Ready(result),
             }
@@ -1012,7 +1012,15 @@ impl Future for SendFutNoq<'_, '_> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        Pin::new(&mut this.sender).poll_send(this.transmit, cx)
+        loop {
+            n0_future::ready!(this.sender.waiter.poll(&this.sender.socket, cx))?;
+            // Preserve async send's recovery from write errors. The lower-level
+            // UdpSender::poll_send instead returns those errors to its caller.
+            match this.sender.socket.try_send_noq(this.transmit) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                result => return Poll::Ready(result),
+            }
+        }
     }
 }
 

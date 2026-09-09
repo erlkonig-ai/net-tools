@@ -119,28 +119,24 @@ async fn senders_unregister_on_cancel_and_complete() -> TestResult {
     let (counts, wakers) = wake_counters::<2>();
     let transmit = test_transmit(sink.local_addr()?);
     let guard = socket.socket.write().unwrap();
-    assert!(
-        Pin::new(&mut first)
-            .poll_send(&transmit, &mut Context::from_waker(&wakers[0]))
-            .is_pending()
-    );
-    assert!(
-        Pin::new(&mut second)
-            .poll_send(&transmit, &mut Context::from_waker(&wakers[1]))
-            .is_pending()
-    );
-    assert!(
-        Arc::strong_count(&counts[0]) > 2,
-        "first waiter must be independently registered"
-    );
+    let first_poll =
+        Pin::new(&mut first).poll_send(&transmit, &mut Context::from_waker(&wakers[0]));
+    let second_poll =
+        Pin::new(&mut second).poll_send(&transmit, &mut Context::from_waker(&wakers[1]));
+    let registered = Arc::strong_count(&counts[0]);
     drop(first);
-    assert_eq!(
-        Arc::strong_count(&counts[0]),
-        2,
-        "cancelled waiter retained its task"
-    );
+    let after_cancel = Arc::strong_count(&counts[0]);
     drop(guard);
     socket.wake_all();
+    // Assert outside the write guard so a failing regression does not poison
+    // the old implementation's socket and panic again during its Drop.
+    assert!(first_poll.is_pending());
+    assert!(second_poll.is_pending());
+    assert!(
+        registered > 2,
+        "first waiter must be independently registered"
+    );
+    assert_eq!(after_cancel, 2, "cancelled waiter retained its task");
     assert_eq!(counts[0].0.load(Ordering::SeqCst), 0);
     assert!(counts[1].0.load(Ordering::SeqCst) > 0);
     tokio::time::sleep(Duration::from_millis(2)).await;
@@ -274,4 +270,21 @@ fn send_types_remain_send_sync_unpin() {
     check::<SendFut<'static, 'static>>();
     check::<SendToFut<'static, 'static>>();
     check::<SendFutNoq<'static, 'static>>();
+}
+
+#[tokio::test]
+async fn senders_do_not_reopen_explicitly_closed_socket() -> TestResult {
+    let socket = Arc::new(UdpSocket::bind_local_v4(0)?);
+    let mut sender = socket.clone().create_sender();
+    let transmit = test_transmit(socket.local_addr()?);
+    socket.close().await;
+    let (_, wakers) = wake_counters::<1>();
+    let result = Pin::new(&mut sender).poll_send(&transmit, &mut Context::from_waker(&wakers[0]));
+    assert!(matches!(result, Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::BrokenPipe));
+    assert_eq!(
+        sender.send(&transmit).await.unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    assert!(socket.is_closed());
+    Ok(())
 }
