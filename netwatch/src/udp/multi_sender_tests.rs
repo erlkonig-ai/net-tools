@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Wake, Waker};
 use std::time::Duration;
 
 use testresult::TestResult;
@@ -197,6 +198,10 @@ async fn senders_reusable_after_ready_and_would_block() -> TestResult {
             );
             assert_eq!(Arc::strong_count(&counts[i]), 2);
         }
+        // These manual polls are all in one task. Let Tokio reset its
+        // cooperative budget between cycles, rather than mistaking a forced
+        // scheduler yield for socket backpressure.
+        tokio::task::yield_now().await;
     }
     socket.close().await;
     Ok(())

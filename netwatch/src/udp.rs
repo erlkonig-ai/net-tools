@@ -349,16 +349,19 @@ impl UdpSocket {
         let mut guard = self.socket.write().unwrap_or_else(|e| e.into_inner());
 
         // Re-check after acquiring the write lock — another caller may have
-        // already completed the rebind while we were waiting.
-        if !self.is_broken() {
-            return Ok(());
-        }
-
-        let result = guard.rebind();
-        if result.is_ok() {
-            self.is_broken
-                .store(false, std::sync::atomic::Ordering::Release);
-        }
+        // already completed the rebind while we were waiting. Even in that
+        // case, senders can have observed our write lock after the previous
+        // rebind's notification. Every path must unlock and notify them.
+        let result = if self.is_broken() {
+            let result = guard.rebind();
+            if result.is_ok() {
+                self.is_broken
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+            result
+        } else {
+            Ok(())
+        };
         drop(guard);
         self.wake_all();
         result
